@@ -1,15 +1,42 @@
 from flask import Flask, jsonify
-import subprocess
 import platform
 import psutil
 from datetime import datetime, timedelta
 import time
-import os
-import GPUtil
 import cpuinfo
-import pyamdgpuinfo
-# import pyadl
-# from pyadl import ADLManager
+import docker
+from docker.errors import APIError
+
+
+def get_docker_container_info():
+    try:
+        client = docker.from_env()  # Initialize Docker client from environment
+        container_info = []
+
+        # Iterate over all containers
+        for container in client.containers.list():
+            info = {
+                'id': container.id,
+                'name': container.name,
+                'image': container.image.tags[0] if container.image.tags else 'N/A',
+                'status': container.status,
+                'ports': container.ports,
+                'created': container.attrs['Created'],
+                'cpu_usage': container.stats(stream=False)['cpu_stats']['cpu_usage']['total_usage'] / 1e9,
+                'memory_usage': container.stats(stream=False)['memory_stats']['usage'],
+                'network': container.attrs['NetworkSettings']['Networks'],
+            }
+            container_info.append(info)
+
+        return container_info
+
+    except docker.errors.APIError as e:
+        print(f"Error accessing Docker API: {e}")
+        return None
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        return None
+
 
 #TODO Get tuples from _common.py
 def psutil_stats():
@@ -18,7 +45,7 @@ def psutil_stats():
 
         'cpu': {
             "cores": psutil.cpu_count(),
-            'load_average (min)': {
+            'load_average (min : %)': {
                 "1": psutil.getloadavg()[0] if hasattr(psutil, 'getloadavg') else None,
                 "5": psutil.getloadavg()[1] if hasattr(psutil, 'getloadavg') else None,
                 "15": psutil.getloadavg()[2] if hasattr(psutil, 'getloadavg') else None,
@@ -30,6 +57,16 @@ def psutil_stats():
                 "syscalls": psutil.cpu_stats().syscalls if hasattr(psutil.cpu_stats(), 'syscalls') else None
             },
             "info": cpuinfo.get_cpu_info(),
+            'processes': {
+                proc.name(): {
+                    'pid': proc.pid,
+                    'cpu_percent': proc.cpu_percent(),
+                    'memory_percent': proc.memory_percent(),
+                    'status': proc.status(),
+                    'create_time': proc.create_time()
+                } for proc in
+                psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status', 'create_time'])
+            },
             "times": {
                 "per_cpu (sec)": [
                     {
@@ -62,69 +99,93 @@ def psutil_stats():
         #         "used %": psutil.disk_usage(disk.mountpoint).percent
         #     } for disk in psutil.disk_partitions()
         # },
-        'disk_io': {
-            disk: {
-                "read_count": counters.read_count,
-                "write_count": counters.write_count,
-                "read_bytes": counters.read_bytes,
-                "write_bytes": counters.write_bytes,
-                "read_time": counters.read_time,
-                "write_time": counters.write_time
-            } for disk, counters in psutil.disk_io_counters(perdisk=True).items()
+        "disk": {
+            'io': {
+                disk: {
+                    "read_count": counters.read_count,
+                    "write_count": counters.write_count,
+                    "read_bytes": counters.read_bytes,
+                    "write_bytes": counters.write_bytes,
+                    "read_time": counters.read_time,
+                    "write_time": counters.write_time
+                } for disk, counters in psutil.disk_io_counters(perdisk=True).items()
+            },
+            'file_systems': {
+                partition.mountpoint: {
+                    'device': partition.device,
+                    'fstype': partition.fstype,
+                    'opts': partition.opts,
+                    'total': psutil.disk_usage(partition.mountpoint).total,
+                    'used': psutil.disk_usage(partition.mountpoint).used,
+                    'free': psutil.disk_usage(partition.mountpoint).free,
+                    'percent': psutil.disk_usage(partition.mountpoint).percent
+                } for partition in psutil.disk_partitions()
+            },
         },
-        'file_systems': {
-            partition.mountpoint: {
-                'device': partition.device,
-                'fstype': partition.fstype,
-                'opts': partition.opts,
-                'total': psutil.disk_usage(partition.mountpoint).total,
-                'used': psutil.disk_usage(partition.mountpoint).used,
-                'free': psutil.disk_usage(partition.mountpoint).free,
-                'percent': psutil.disk_usage(partition.mountpoint).percent
-            } for partition in psutil.disk_partitions()
+        "docker": {
+            container["name"]: container for container in get_docker_container_info()
         },
-
-        'memory (bytes)': { #todo in b Mb Gb?
-            "total": psutil.virtual_memory().total,
-            "available": psutil.virtual_memory().available,
-            "percent": psutil.virtual_memory().percent,
-            "used": psutil.virtual_memory().used,
-            "free": psutil.virtual_memory().free,
-            "active": psutil.virtual_memory().active if hasattr(psutil.virtual_memory(), 'active') else None,
-            "inactive": psutil.virtual_memory().inactive if hasattr(psutil.virtual_memory(), 'inactive') else None,
-            "buffers": psutil.virtual_memory().buffers if hasattr(psutil.virtual_memory(), 'buffers') else None,
-            "cached": psutil.virtual_memory().cached if hasattr(psutil.virtual_memory(), 'cached') else None,
-            "wired": psutil.virtual_memory().wired if hasattr(psutil.virtual_memory(), 'wired') else None,
-            "shared": psutil.virtual_memory().shared if hasattr(psutil.virtual_memory(), 'shared') else None
+        "kubernetes": {}, #todo
+        "vm": {}, #todo
+        "memory": {
+            'ram (gb)': {  # todo in b Mb Gb?
+                "total": round(psutil.virtual_memory().total / (1024 ** 3), 2),
+                "available": round(psutil.virtual_memory().available / (1024 ** 3), 2),
+                "percent": psutil.virtual_memory().percent,
+                "used": round(psutil.virtual_memory().used / (1024 ** 3), 2),
+                "free": round(psutil.virtual_memory().free / (1024 ** 3), 2),
+                "active": round(psutil.virtual_memory().active / (1024 ** 3), 2) if hasattr(psutil.virtual_memory(), 'active') else None,
+                "inactive": round(psutil.virtual_memory().inactive / (1024 ** 3), 2) if hasattr(psutil.virtual_memory(), 'inactive') else None,
+                "buffers": round(psutil.virtual_memory().buffers / (1024 ** 3), 2) if hasattr(psutil.virtual_memory(), 'buffers') else None,
+                "cached": round(psutil.virtual_memory().cached / (1024 ** 3), 2) if hasattr(psutil.virtual_memory(), 'cached') else None,
+                "wired": round(psutil.virtual_memory().wired / (1024 ** 3), 2) if hasattr(psutil.virtual_memory(), 'wired') else None,
+                "shared": round(psutil.virtual_memory().shared / (1024 ** 3), 2) if hasattr(psutil.virtual_memory(), 'shared') else None
+            },
+            'swap (bytes)': {
+                "total": psutil.swap_memory().total,
+                "used": psutil.swap_memory().used,
+                "free": psutil.swap_memory().free,
+                "percent": psutil.swap_memory().percent,
+                "sin": psutil.swap_memory().sin,
+                "sout": psutil.swap_memory().sout
+            },
         },
-        'network_connections': {
-            conn.pid: {
-                'fd': conn.fd,
-                'family': conn.family,
-                'type': conn.type,
-                'laddr': {
-                    "ip": conn.laddr.ip,
-                    "port": conn.laddr.port
-                },
-                'raddr': conn.raddr,
-                'status': conn.status,
-            } for conn in psutil.net_connections()
-            if conn.pid is not None  # Filter out connections with no associated PID
-        },
-        'network_io': {
-            interface: {
-                "bytes_sent": counters.bytes_sent,
-                "bytes_recv": counters.bytes_recv,
-                "packets_sent": counters.packets_sent,
-                "packets_recv": counters.packets_recv,
-                "errin": counters.errin,
-                "errout": counters.errout,
-                "dropin": counters.dropin,
-                "dropout": counters.dropout
-            } for interface, counters in psutil.net_io_counters(pernic=True).items()
-        },
-        'network_interfaces': {
-            interface: psutil.net_if_addrs()[interface] for interface in psutil.net_if_addrs()
+        "network": {
+            'connections': {
+                conn.pid: {
+                    'fd': conn.fd,
+                    'family': conn.family,
+                    'type': conn.type,
+                    'laddr': {
+                        "ip": conn.laddr.ip,
+                        "port": conn.laddr.port
+                    },
+                    'raddr': conn.raddr,
+                    'status': conn.status,
+                } for conn in psutil.net_connections()
+                if conn.pid is not None  # Filter out connections with no associated PID
+            },
+            'io': {
+                interface: {
+                    "bytes_sent": counters.bytes_sent,
+                    "bytes_recv": counters.bytes_recv,
+                    "packets_sent": counters.packets_sent,
+                    "packets_recv": counters.packets_recv,
+                    "errin": counters.errin,
+                    "errout": counters.errout,
+                    "dropin": counters.dropin,
+                    "dropout": counters.dropout
+                } for interface, counters in psutil.net_io_counters(pernic=True).items()
+            },
+            "interfaces": {
+                interface: {
+                    'family': label.family,
+                    'address': label.address,
+                    'netmask': label.netmask,
+                    'broadcast': label.broadcast,
+                    'ptp': label.ptp
+                } for interface, labels in psutil.net_if_addrs().items() for label in labels
+            },
         },
         "platform": {
             "system": platform.system(),
@@ -135,23 +196,6 @@ def psutil_stats():
             # "java": platform.java_ver(),
             "release": platform.release(),
             'kernel_version': platform.uname().release
-        },
-        'processes': {
-            proc.name(): {
-                'pid': proc.pid,
-                'cpu_percent': proc.cpu_percent(),
-                'memory_percent': proc.memory_percent(),
-                'status': proc.status(),
-                'create_time': proc.create_time()
-            } for proc in psutil.process_iter(['pid', 'name', 'cpu_percent', 'memory_percent', 'status', 'create_time'])
-        },
-        'swap (bytes)': {
-            "total": psutil.swap_memory().total,
-            "used": psutil.swap_memory().used,
-            "free": psutil.swap_memory().free,
-            "percent": psutil.swap_memory().percent,
-            "sin": psutil.swap_memory().sin,
-            "sout": psutil.swap_memory().sout
         },
         'temps': psutil.sensors_temperatures(fahrenheit=True),
         "time": {
@@ -165,7 +209,16 @@ def psutil_stats():
                     "started": f"{timedelta(seconds=int(time.time() - user[3]))} ago"
                 } for user in psutil.users()
         },
+
     }
+
+
+# todo
+# voltage
+# go alerts
+# temps
+# kubernetes
+
 
 
 app = Flask(__name__)
